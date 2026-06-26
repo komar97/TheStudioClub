@@ -1,13 +1,22 @@
 import sqlite3
 from pathlib import Path
 from datetime import date, datetime
-
 import pandas as pd
 import streamlit as st
 
 
+# Dossier OneDrive ou seront stockes uniquement les rapports Excel.
+# OneDrive synchronisera automatiquement ces fichiers dans le cloud.
+ONEDRIVE_REPORTS_DIR = Path(r"C:\Users\MARKO\OneDrive\MARCO\TheStudioClub") / "Historique_Excel"
+
+# La base reste locale, a cote de l'application. Rien d'autre que les Excel n'est envoye dans OneDrive.
 DB_FILE = Path("stock.db")
 ADMIN_PASSWORD = "1234"
+
+ARTICLES_NON_ALCOOL = [
+    "Jus", "Pepsi", "Limonade", "Tonic", "Mega Force", "Crazy Tiger",
+    "Perrier", "BIB", "Sirop"
+]
 
 
 INITIAL_ARTICLES = [
@@ -62,6 +71,10 @@ INITIAL_ARTICLES = [
     ("Sirop Citron", 3),
     ("Sirop Menthe", 3),
 ]
+
+
+def ensure_storage_dirs():
+    ONEDRIVE_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def connect():
@@ -205,6 +218,114 @@ def get_daily_summary():
     conn.close()
     return df
 
+
+def is_alcool(article):
+    nom = str(article).strip()
+    return not any(nom.lower().startswith(prefix.lower()) for prefix in ARTICLES_NON_ALCOOL)
+
+
+def style_excel_sheet(ws):
+    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+    from openpyxl.utils import get_column_letter
+
+    header_fill = PatternFill("solid", fgColor="111827")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="CBD5E1")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.border = border
+            cell.alignment = Alignment(vertical="center")
+
+    for col in ws.columns:
+        max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+        width = min(max(max_len + 3, 12), 38)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = width
+
+
+def is_stock_faible(stock):
+    try:
+        return int(stock) <= int(st.session_state.get("seuil_stock_faible", 3))
+    except Exception:
+        return False
+
+
+def build_excel_report(personne, mouvements_valides):
+    from openpyxl.styles import Font, PatternFill
+
+    stock_actuel = get_articles()
+
+    # IMPORTANT : l'historique doit contenir TOUS les articles du stock.
+    # L'ancienne version filtrait uniquement les alcools, ce qui expliquait
+    # pourquoi l'Excel affichait environ 33 lignes au lieu des 50 articles.
+    stock_export = stock_actuel.copy().rename(columns={"article": "Article", "stock": "Stock actuel"})
+    stock_export["Catégorie"] = stock_export["Article"].apply(lambda x: "Alcool" if is_alcool(x) else "Soft / autre")
+    stock_export["Alerte"] = stock_export["Stock actuel"].apply(lambda x: "Stock faible" if is_stock_faible(x) else "")
+    stock_export = stock_export[["Article", "Catégorie", "Stock actuel", "Alerte"]]
+
+    resume = pd.DataFrame(mouvements_valides)
+    if not resume.empty:
+        resume = resume.rename(columns={
+            "article": "Article",
+            "sortie": "Sortie",
+            "entree": "Entrée",
+            "ancien_stock": "Ancien stock",
+            "nouveau_stock": "Nouveau stock",
+        })
+        resume = resume[["Article", "Sortie", "Entrée", "Ancien stock", "Nouveau stock"]]
+    else:
+        resume = pd.DataFrame(columns=["Article", "Sortie", "Entrée", "Ancien stock", "Nouveau stock"])
+
+    totaux = pd.DataFrame([{
+        "Date": date.today().strftime("%d/%m/%Y"),
+        "Heure": datetime.now().strftime("%H:%M:%S"),
+        "Personne": personne,
+        "Total sorties": int(resume["Sortie"].sum()) if not resume.empty else 0,
+        "Total entrées": int(resume["Entrée"].sum()) if not resume.empty else 0,
+        "Articles modifiés": len(resume),
+        "Articles au total": len(stock_export),
+        "Stock total": int(stock_export["Stock actuel"].sum()) if not stock_export.empty else 0,
+        "Articles en stock faible": int((stock_export["Alerte"] == "Stock faible").sum()) if not stock_export.empty else 0,
+    }])
+
+    month_dir = ONEDRIVE_REPORTS_DIR / date.today().strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"Stock_{date.today().strftime('%Y-%m-%d')}_{datetime.now().strftime('%H-%M-%S')}.xlsx"
+    output_path = month_dir / filename
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        stock_export.to_excel(writer, sheet_name="Stock actuel", index=False)
+        resume.to_excel(writer, sheet_name="Mouvements du jour", index=False)
+        totaux.to_excel(writer, sheet_name="Résumé", index=False)
+
+        for sheet_name in writer.sheets:
+            style_excel_sheet(writer.sheets[sheet_name])
+
+        red_fill = PatternFill("solid", fgColor="FEE2E2")
+        red_font = Font(color="991B1B", bold=True)
+        ws_stock = writer.sheets["Stock actuel"]
+        alerte_col = ws_stock.max_column
+        for row in range(2, ws_stock.max_row + 1):
+            if ws_stock.cell(row=row, column=alerte_col).value == "Stock faible":
+                for col in range(1, ws_stock.max_column + 1):
+                    ws_stock.cell(row=row, column=col).fill = red_fill
+                    ws_stock.cell(row=row, column=col).font = red_font
+
+    return output_path
+
+
+def save_daily_report(personne, mouvements_valides):
+    return build_excel_report(personne, mouvements_valides)
 
 def movement_key(kind, article_id):
     return f"{kind}_{article_id}"
@@ -472,6 +593,7 @@ st.set_page_config(
 )
 
 css()
+ensure_storage_dirs()
 init_db()
 
 if "seuil_stock_faible" not in st.session_state:
@@ -595,6 +717,7 @@ if st.session_state.page == "stock":
                 st.error("Écris le nom de la personne avant de valider.")
             else:
                 count = 0
+                mouvements_valides = []
 
                 for move in movements:
                     if move["sortie"] or move["entree"]:
@@ -609,14 +732,31 @@ if st.session_state.page == "stock":
                             ancien_stock=move["stock"],
                             nouveau_stock=new_stock,
                         )
+                        mouvements_valides.append({
+                            "article": move["article"],
+                            "sortie": move["sortie"],
+                            "entree": move["entree"],
+                            "ancien_stock": move["stock"],
+                            "nouveau_stock": new_stock,
+                        })
                         count += 1
 
                 if count == 0:
                     st.info("Aucune sortie ou entrée renseignée.")
                 else:
-                    reset_movements()
-                    st.success(f"Stock mis à jour par {personne}.")
-                    st.rerun()
+                    try:
+                        report_path = save_daily_report(personne.strip(), mouvements_valides)
+                        reset_movements()
+                        st.success(
+                            "Stock mis à jour. Rapport Excel complet sauvegardé dans OneDrive : "
+                            f"{report_path}"
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.warning(
+                            "Stock mis à jour, mais la sauvegarde OneDrive n'a pas pu être créée. "
+                            f"Erreur : {e}"
+                        )
 
     low_stock = articles[articles["stock"] <= seuil].copy()
 
